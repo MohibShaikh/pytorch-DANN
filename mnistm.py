@@ -3,6 +3,7 @@ from torch.utils.data import SubsetRandomSampler, DataLoader
 from torchvision import transforms
 import torch.utils.data as data
 import torch
+import numpy as np
 import os
 import errno
 from PIL import Image
@@ -10,189 +11,169 @@ import params
 
 
 # MNIST-M
-class MNISTM(data.Dataset):
-    """`MNIST-M Dataset."""
-
-    url = "https://github.com/VanushVaswani/keras_mnistm/releases/download/1.0/keras_mnistm.pkl.gz"
-
-    raw_folder = 'raw'
-    processed_folder = 'processed'
-    training_file = 'mnist_m_train.pt'
-    test_file = 'mnist_m_test.pt'
-
-    def __init__(self,
-                 root, mnist_root="data",
-                 train=True,
-                 transform=None, target_transform=None,
-                 download=False):
-        """Init MNIST-M dataset."""
-        super(MNISTM, self).__init__()
-        self.root = os.path.expanduser(root)
-        self.mnist_root = os.path.expanduser(mnist_root)
+class ModelNetDataset(data.Dataset):
+    """Princeton ModelNet Dataset for 3D object classification."""
+    
+    def __init__(self, root, npoints=1024, split='train', classes=None, transform=None):
+        """
+        Args:
+            root (str): Root directory of the ModelNet dataset.
+            npoints (int): Number of points to sample from the 3D model.
+            split (str): 'train' or 'test'.
+            classes (list of str): List of class names to load. Load all classes if None.
+            transform (callable, optional): Optional transform to be applied on a sample.
+        """
+        self.root = root
+        self.npoints = npoints
+        self.split = split
         self.transform = transform
-        self.target_transform = target_transform
-        self.train = train  # training set or test set
 
-        if download:
-            self.download()
+        self.categories = classes if classes else self._get_categories()
+        self.files = self._get_files()
 
-        if not self._check_exists():
-            raise RuntimeError('Dataset not found.' +
-                               ' You can use download=True to download it')
+    def _get_categories(self):
+        """Returns the list of object categories."""
+        return sorted(os.listdir(os.path.join(self.root, self.split)))
 
-        if self.train:
-            self.train_data, self.train_labels = \
-                torch.load(os.path.join(self.root,
-                                        self.processed_folder,
-                                        self.training_file))
-        else:
-            self.test_data, self.test_labels = \
-                torch.load(os.path.join(self.root,
-                                        self.processed_folder,
-                                        self.test_file))
+    def _get_files(self):
+        """Returns a list of file paths for all 3D models."""
+        files = []
+        for category in self.categories:
+            category_path = os.path.join(self.root, self.split, category)
+            for model in os.listdir(category_path):
+                if model.endswith('.off'):
+                    files.append((category, os.path.join(category_path, model)))
+        return files
+
+    def _load_model(self, path):
+        """Loads a 3D model and samples points from its surface."""
+        mesh = trimesh.load(path)
+        points = mesh.sample(self.npoints)  # Sample npoints from the surface
+        return points
 
     def __getitem__(self, index):
-        """Get images and target for data loader.
+        """Get the 3D point cloud and the corresponding target class."""
+        category, path = self.files[index]
+        points = self._load_model(path)
+        label = self.categories.index(category)
 
-        Args:
-            index (int): Index
+        points = torch.tensor(points, dtype=torch.float32)
+        label = torch.tensor(label, dtype=torch.long)
 
-        Returns:
-            tuple: (image, target) where target is index of the target class.
-        """
-        if self.train:
-            img, target = self.train_data[index], self.train_labels[index]
-        else:
-            img, target = self.test_data[index], self.test_labels[index]
+        if self.transform:
+            points = self.transform(points)
 
-        # doing this so that it is consistent with all other datasets
-        # to return a PIL Image
-        # print(type(img))
-        img = Image.fromarray(img.squeeze().numpy(), mode='RGB')
-
-        if self.transform is not None:
-            img = self.transform(img)
-
-        if self.target_transform is not None:
-            target = self.target_transform(target)
-
-        return img, target
+        return points, label
 
     def __len__(self):
-        """Return size of dataset."""
-        if self.train:
-            return len(self.train_data)
-        else:
-            return len(self.test_data)
+        """Return the size of the dataset."""
+        return len(self.files)
 
-    def _check_exists(self):
-        return os.path.exists(os.path.join(self.root,
-                                           self.processed_folder,
-                                           self.training_file)) and \
-               os.path.exists(os.path.join(self.root,
-                                           self.processed_folder,
-                                           self.test_file))
+class RandomRotate(object):
+    """Randomly rotate the point cloud around the z-axis."""
+    def __call__(self, pointcloud):
+        theta = np.random.uniform(0, 2 * np.pi)
+        rotation_matrix = np.array([[np.cos(theta), -np.sin(theta), 0],
+                                    [np.sin(theta),  np.cos(theta), 0],
+                                    [0, 0, 1]])
+        return torch.matmul(pointcloud, torch.tensor(rotation_matrix, dtype=torch.float32))
 
-    def download(self):
-        """Download the MNIST data."""
-        # import essential packages
-        from six.moves import urllib
-        import gzip
-        import pickle
-        from torchvision import datasets
+class RandomScale(object):
+    """Randomly scale the point cloud."""
+    def __call__(self, pointcloud):
+        scale = np.random.uniform(0.8, 1.25)
+        return pointcloud * scale
 
-        # check if dataset already exists
-        if self._check_exists():
-            return
+class RandomTranslate(object):
+    """Randomly translate the point cloud."""
+    def __call__(self, pointcloud):
+        translation = np.random.uniform(-0.2, 0.2, size=(3,))
+        return pointcloud + torch.tensor(translation, dtype=torch.float32)
 
-        # make data dirs
-        try:
-            os.makedirs(os.path.join(self.root, self.raw_folder))
-            os.makedirs(os.path.join(self.root, self.processed_folder))
-        except OSError as e:
-            if e.errno == errno.EEXIST:
-                pass
-            else:
-                raise
+class Jitter(object):
+    """Randomly jitter the points in the point cloud."""
+    def __init__(self, sigma=0.01, clip=0.05):
+        self.sigma = sigma
+        self.clip = clip
 
-        # download pkl files
-        print('Downloading ' + self.url)
-        filename = self.url.rpartition('/')[2]
-        file_path = os.path.join(self.root, self.raw_folder, filename)
-        if not os.path.exists(file_path.replace('.gz', '')):
-            data = urllib.request.urlopen(self.url)
-            with open(file_path, 'wb') as f:
-                f.write(data.read())
-            with open(file_path.replace('.gz', ''), 'wb') as out_f, \
-                    gzip.GzipFile(file_path) as zip_f:
-                out_f.write(zip_f.read())
-            os.unlink(file_path)
+    def __call__(self, pointcloud):
+        jittered_data = pointcloud + torch.clamp(self.sigma * torch.randn_like(pointcloud), -self.clip, self.clip)
+        return jittered_data
 
-        # process and save as torch files
-        print('Processing...')
+class Normalize(object):
+    """Normalize the point cloud to fit in a unit sphere."""
+    def __call__(self, pointcloud):
+        centroid = torch.mean(pointcloud, dim=0)
+        pointcloud = pointcloud - centroid
+        furthest_distance = torch.max(torch.sqrt(torch.sum(pointcloud ** 2, dim=1)))
+        pointcloud = pointcloud / furthest_distance
+        return pointcloud
 
-        # load MNIST-M images from pkl file
-        with open(file_path.replace('.gz', ''), "rb") as f:
-            mnist_m_data = pickle.load(f, encoding='bytes')
-        mnist_m_train_data = torch.ByteTensor(mnist_m_data[b'train'])
-        mnist_m_test_data = torch.ByteTensor(mnist_m_data[b'test'])
-
-        # get MNIST labels
-        mnist_train_labels = datasets.MNIST(root=self.mnist_root,
-                                            train=True,
-                                            download=True).train_labels
-        mnist_test_labels = datasets.MNIST(root=self.mnist_root,
-                                           train=False,
-                                           download=True).test_labels
-
-        # save MNIST-M dataset
-        training_set = (mnist_m_train_data, mnist_train_labels)
-        test_set = (mnist_m_test_data, mnist_test_labels)
-        with open(os.path.join(self.root,
-                               self.processed_folder,
-                               self.training_file), 'wb') as f:
-            torch.save(training_set, f)
-        with open(os.path.join(self.root,
-                               self.processed_folder,
-                               self.test_file), 'wb') as f:
-            torch.save(test_set, f)
-
-        print('MNISTM Done!')
+class ToTensor(object):
+    """Convert point cloud numpy array to PyTorch tensor."""
+    def __call__(self, pointcloud):
+        return torch.tensor(pointcloud, dtype=torch.float32)
 
 
-transform = transforms.Compose([transforms.ToTensor(),
-                                transforms.Normalize((0.29730626, 0.29918741, 0.27534935),
-                                                     (0.32780124, 0.32292358, 0.32056796))
-                                ])
 
-mnistm_train_dataset = MNISTM(root='../data/MNIST-M', train=True, download=True,
-                              transform=transform)
-mnistm_valid_dataset = MNISTM(root='../data/MNIST-M', train=True, download=True,
-                              transform=transform)
-mnistm_test_dataset = MNISTM(root='../data/MNIST-M', train=False, transform=transform)
+transform = transforms.Compose([
+    RandomRotate(),
+    RandomScale(),
+    RandomTranslate(),
+    Jitter(),
+    Normalize(),
+    ToTensor()
 
-indices = list(range(len(mnistm_train_dataset)))
-validation_size = 5000
-train_idx, valid_idx = indices[validation_size:], indices[:validation_size]
-train_sampler = SubsetRandomSampler(train_idx)
-valid_sampler = SubsetRandomSampler(valid_idx)
 
-mnistm_train_loader = DataLoader(
-    mnistm_train_dataset,
-    batch_size=params.batch_size,
-    sampler=train_sampler,
-    num_workers=params.num_workers
-)
+])
 
-mnistm_valid_loader = DataLoader(
-    mnistm_valid_dataset,
-    batch_size=params.batch_size,
-    sampler=train_sampler,
-    num_workers=params.num_workers
-)
 
-mnistm_test_loader = DataLoader(
-    mnistm_test_dataset,
-    batch_size=params.batch_size,
-    num_workers=params.num_workers
-)
+root_dir = '/path/to/ModelNet40'  # Change to your ModelNet root directory
+dataset = ModelNetDataset(root=root_dir, npoints=2048, split='train', transform=transform)
+
+
+train_loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)
+
+# Example: Iterate through the data loader
+for points, labels in train_loader:
+    print(points.shape)  # Should be (batch_size, npoints, 3)
+    print(labels.shape)  # Should be (batch_size,)
+    break
+
+dataset_size = len(dataset)
+indices = list(range(dataset_size))
+validation_size = int(0.2 * dataset_size)  # 20% for validation
+test_size = int(0.1 * dataset_size)        # 10% for testing
+
+# Shuffle the dataset and split indices
+np.random.shuffle(indices)
+train_indices, val_indices, test_indices = indices[validation_size + test_size:], indices[:validation_size], indices[validation_size:validation_size + test_size]
+
+# Create samplers for each dataset
+train_sampler = SubsetRandomSampler(train_indices)
+val_sampler = SubsetRandomSampler(val_indices)
+test_sampler = SubsetRandomSampler(test_indices)
+
+# Create DataLoader for each split
+batch_size = 32
+train_loader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, num_workers=4)
+val_loader = DataLoader(dataset, batch_size=batch_size, sampler=val_sampler, num_workers=4)
+test_loader = DataLoader(dataset, batch_size=batch_size, sampler=test_sampler, num_workers=4)
+
+# Example: Iterate through the train data loader
+for points, labels in train_loader:
+    print(points.shape)  # Should be (batch_size, npoints, 3)
+    print(labels.shape)  # Should be (batch_size,)
+    break
+
+# Example: Iterate through the validation data loader
+for points, labels in val_loader:
+    print(points.shape)  # Should be (batch_size, npoints, 3)
+    print(labels.shape)  # Should be (batch_size,)
+    break
+
+# Example: Iterate through the test data loader
+for points, labels in test_loader:
+    print(points.shape)  # Should be (batch_size, npoints, 3)
+    print(labels.shape)  # Should be (batch_size,)
+    break
