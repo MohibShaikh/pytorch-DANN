@@ -117,14 +117,13 @@ class ToTensor(object):
 
 
 transform = transforms.Compose([
+    ToTensor().
     RandomRotate(),
     RandomScale(),
     RandomTranslate(),
     Jitter(),
     Normalize(),
     ToTensor()
-
-
 ])
 
 
